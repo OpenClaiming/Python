@@ -1,13 +1,17 @@
 # Optional strict canonicalizer:
 # pip install rfc8785
 # https://github.com/trailofbits/rfc8785.py
+#
+# Required crypto package:
+# pip install cryptography
 
 import json
 import base64
 import urllib.request
 import time
+import hashlib
 
-from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric import ec, utils
 from cryptography.hazmat.primitives import hashes, serialization
 
 try:
@@ -21,86 +25,57 @@ class OpenClaim:
 
 	# ---------- CACHE ----------
 
-	_fetch_cache = {}
-	_fetch_cache_time = {}
-	_fetch_ttl = 300  # seconds
+	_FETCH_TTL = 60  # seconds, matching the JS 60_000 ms ttl
 
+	_url_cache = {}
+	_url_cache_time = {}
 
-	@staticmethod
-	def _fetch_cached(url):
+	_key_cache = {}
+	_key_cache_time = {}
 
-		now = time.time()
+	_pubkey_cache = {}
+	_pubkey_cache_time = {}
 
-		if url in OpenClaim._fetch_cache:
-			t = OpenClaim._fetch_cache_time.get(url, 0)
-			if (now - t) < OpenClaim._fetch_ttl:
-				return OpenClaim._fetch_cache[url]
-
-		data = None
-
-		try:
-			with urllib.request.urlopen(url) as f:
-				data = f.read().decode()
-		except Exception:
-			pass
-
-		# cache even failures
-		OpenClaim._fetch_cache[url] = data
-		OpenClaim._fetch_cache_time[url] = now
-
-		return data
-
+	# ---------- TIME ----------
 
 	@staticmethod
-	def clear_fetch_cache(url=None):
-		if url is None:
-			OpenClaim._fetch_cache = {}
-			OpenClaim._fetch_cache_time = {}
-		else:
-			OpenClaim._fetch_cache.pop(url, None)
-			OpenClaim._fetch_cache_time.pop(url, None)
+	def _now():
+		return time.time()
 
+	@staticmethod
+	def _get_cache(map_obj, time_map, key):
+		if key not in map_obj:
+			return None
+
+		t = time_map.get(key, 0)
+
+		if (OpenClaim._now() - t) > OpenClaim._FETCH_TTL:
+			map_obj.pop(key, None)
+			time_map.pop(key, None)
+			return None
+
+		return map_obj[key]
+
+	@staticmethod
+	def _set_cache(map_obj, time_map, key, value):
+		map_obj[key] = value
+		time_map[key] = OpenClaim._now()
+
+	# ---------- EXISTING ----------
 
 	@staticmethod
 	def normalize(v):
 
-		if isinstance(v, dict):
-			return {k: OpenClaim.normalize(v[k]) for k in sorted(v)}
-
 		if isinstance(v, list):
 			return [OpenClaim.normalize(x) for x in v]
 
+		if isinstance(v, dict):
+			return {k: OpenClaim.normalize(v[k]) for k in sorted(v)}
+
+		if isinstance(v, (int, float)) and not isinstance(v, bool):
+			return str(v)
+
 		return v
-
-
-	@staticmethod
-	def fallback_canonicalize(obj):
-
-		n = OpenClaim.normalize(obj)
-
-		return json.dumps(
-			n,
-			separators=(",",":")
-		).encode()
-
-
-	@staticmethod
-	def canonicalize(claim):
-
-		obj = dict(claim)
-
-		obj.pop("sig", None)
-
-		if STRICT:
-			try:
-				return rfc8785.canonicalize(obj)
-			except Exception:
-				pass
-
-		return OpenClaim.fallback_canonicalize(obj)
-
-
-	# ---------- NEW HELPERS ----------
 
 	@staticmethod
 	def to_array(v):
@@ -108,90 +83,355 @@ class OpenClaim:
 			return []
 		return v if isinstance(v, list) else [v]
 
+	@staticmethod
+	def normalize_signatures(v):
+		arr = OpenClaim.to_array(v)
+		return [None if x is None else str(x) for x in arr]
 
 	@staticmethod
-	def ensure_sorted(keys):
-		if keys != sorted(keys):
-			raise Exception("keys must be lexicographically sorted")
-
+	def ensure_string_keys(keys):
+		for k in keys:
+			if not isinstance(k, str):
+				raise Exception("OpenClaim: all keys must be strings")
 
 	@staticmethod
-	def pem_to_der(pem):
+	def ensure_unique_keys(keys):
+		seen = set()
+
+		for k in keys:
+			if k in seen:
+				raise Exception("OpenClaim: duplicate keys are not allowed")
+			seen.add(k)
+
+	@staticmethod
+	def ensure_sorted_keys(keys):
+		sorted_keys = sorted(keys)
+
+		for i in range(len(keys)):
+			if keys[i] != sorted_keys[i]:
+				raise Exception("OpenClaim: key array must be lexicographically sorted")
+
+	# ---------- PEM / DER ----------
+
+	@staticmethod
+	def strip_pem_headers(pem):
 		return (
-			pem
+			str(pem)
 			.replace("-----BEGIN PUBLIC KEY-----", "")
 			.replace("-----END PUBLIC KEY-----", "")
+			.replace("\r", "")
 			.replace("\n", "")
 			.strip()
 		)
 
+	@staticmethod
+	def der_to_pem(base64_der):
+		body = str(base64_der).replace("\r", "").replace("\n", "").strip()
+		lines = [body[i:i+64] for i in range(0, len(body), 64)]
+
+		return "\n".join([
+			"-----BEGIN PUBLIC KEY-----",
+			*lines,
+			"-----END PUBLIC KEY-----"
+		])
 
 	@staticmethod
-	def der_to_public_key(base64_der):
+	def pem_to_der(pem):
+		return OpenClaim.strip_pem_headers(str(pem))
+
+	@staticmethod
+	def is_pem_public_key(v):
+		return isinstance(v, str) and "BEGIN PUBLIC KEY" in v
+
+	@staticmethod
+	def to_es256_key_string_from_public_pem(public_key_pem):
+		return "data:key/es256;base64," + OpenClaim.pem_to_der(public_key_pem)
+
+	@staticmethod
+	def to_base64_der_string(value):
+		if isinstance(value, bytes):
+			return base64.b64encode(value).decode()
+
+		if isinstance(value, bytearray):
+			return base64.b64encode(bytes(value)).decode()
+
+		if isinstance(value, str):
+			return value
+
+		return str(value)
+
+	# ---------- HASH ----------
+
+	@staticmethod
+	def sha256(buf_or_string):
+		if isinstance(buf_or_string, str):
+			buf_or_string = buf_or_string.encode()
+		return hashlib.sha256(buf_or_string).digest()
+
+	# ---------- CANONICALIZATION ----------
+
+	@staticmethod
+	def fallback_canonicalize(obj):
+		n = OpenClaim.normalize(obj)
+
+		return json.dumps(
+			n,
+			separators=(",", ":"),
+			ensure_ascii=False
+		).encode()
+
+	@staticmethod
+	def canonicalize(claim):
+		obj = dict(claim)
+		obj.pop("sig", None)
+
+		if STRICT:
+			try:
+				if hasattr(rfc8785, "dumps"):
+					out = rfc8785.dumps(obj)
+					return out if isinstance(out, bytes) else str(out).encode()
+
+				if hasattr(rfc8785, "canonicalize"):
+					out = rfc8785.canonicalize(obj)
+					return out if isinstance(out, bytes) else str(out).encode()
+			except Exception:
+				pass
+
+		return OpenClaim.fallback_canonicalize(obj)
+
+	# ---------- FETCH ----------
+
+	@staticmethod
+	def fetch_json(url):
+
+		cached = OpenClaim._get_cache(OpenClaim._url_cache, OpenClaim._url_cache_time, url)
+		if cached is not None:
+			return cached
+
+		json_obj = None
+
+		try:
+			with urllib.request.urlopen(url) as f:
+				raw = f.read().decode()
+				json_obj = json.loads(raw)
+		except Exception:
+			json_obj = None
+
+		OpenClaim._set_cache(OpenClaim._url_cache, OpenClaim._url_cache_time, url, json_obj)
+		return json_obj
+
+	@staticmethod
+	def clear_fetch_cache(url=None):
+		if url is None:
+			OpenClaim._url_cache = {}
+			OpenClaim._url_cache_time = {}
+		else:
+			OpenClaim._url_cache.pop(url, None)
+			OpenClaim._url_cache_time.pop(url, None)
+
+	# ---------- PUBLIC KEY CACHE ----------
+
+	@staticmethod
+	def get_cached_public_key(base64_der):
+
+		cached = OpenClaim._get_cache(OpenClaim._pubkey_cache, OpenClaim._pubkey_cache_time, base64_der)
+		if cached is not None:
+			return cached
+
 		der = base64.b64decode(base64_der)
-		return serialization.load_der_public_key(der)
+		pub = serialization.load_der_public_key(der)
 
+		OpenClaim._set_cache(OpenClaim._pubkey_cache, OpenClaim._pubkey_cache_time, base64_der, pub)
+		return pub
+
+	# ---------- NEW: DATA KEY PARSER ----------
 
 	@staticmethod
-	def resolve_key(key_str):
+	def parse_data_key(key_str):
 
 		if not isinstance(key_str, str):
 			return None
 
-		if ":" not in key_str:
+		if not key_str.startswith("data:key/"):
 			return None
 
-		scheme, rest = key_str.split(":", 1)
-		typ = scheme.upper()
+		idx = key_str.find(",")
+		if idx < 0:
+			return None
 
-		if rest.startswith("http://") or rest.startswith("https://"):
+		meta = key_str[5:idx]  # key/...
+		data = key_str[idx + 1:]
 
-			parts = rest.split("#")
+		parts = meta.split(";")
+		type_part = parts[0]
+		fmt = type_part.replace("key/", "").upper()
+
+		encoding = "raw"
+
+		for p in parts[1:]:
+			if p == "base64":
+				encoding = "base64"
+			if p == "base64url":
+				encoding = "base64url"
+
+		value = data
+
+		if encoding == "base64":
+			value = base64.b64decode(data)
+
+		if encoding == "base64url":
+			remainder = len(data) % 4
+			padding = "=" * (4 - remainder) if remainder else ""
+			b64 = data.replace("-", "+").replace("_", "/") + padding
+			value = base64.b64decode(b64)
+
+		return {
+			"fmt": fmt,
+			"value": value
+		}
+
+	# ---------- KEY RESOLUTION ----------
+
+	@staticmethod
+	def resolve_key(key_str, seen=None):
+
+		if seen is None:
+			seen = set()
+
+		if key_str in seen:
+			raise Exception("OpenClaim: cyclic key reference detected")
+
+		cached = OpenClaim._get_cache(OpenClaim._key_cache, OpenClaim._key_cache_time, key_str)
+		if cached is not None:
+			return cached
+
+		if not key_str or not isinstance(key_str, str):
+			return None
+
+		next_seen = set(seen)
+		next_seen.add(key_str)
+
+		# --- DATA URL ---
+		if key_str.startswith("data:key/"):
+			parsed = OpenClaim.parse_data_key(key_str)
+			if parsed:
+				OpenClaim._set_cache(OpenClaim._key_cache, OpenClaim._key_cache_time, key_str, parsed)
+				return parsed
+
+		# --- URL ---
+		if key_str.startswith("http://") or key_str.startswith("https://"):
+
+			parts = key_str.split("#")
 			url = parts[0]
+			path = parts[1:]
 
-			raw = OpenClaim._fetch_cached(url)
-			if raw is None:
+			json_obj = OpenClaim.fetch_json(url)
+
+			if not json_obj:
+				OpenClaim._set_cache(OpenClaim._key_cache, OpenClaim._key_cache_time, key_str, None)
 				return None
 
-			try:
-				data = json.loads(raw)
-			except Exception:
-				return None
+			current = json_obj
 
-			current = data
-
-			for p in parts[1:]:
+			for p in path:
 				if not p:
 					continue
 
-				if not isinstance(current, dict):
-					return None
-
-				current = current.get(p)
+				if isinstance(current, dict):
+					current = current.get(p)
+				else:
+					current = None
 
 				if current is None:
+					OpenClaim._set_cache(OpenClaim._key_cache, OpenClaim._key_cache_time, key_str, None)
 					return None
 
-			if not isinstance(current, str):
-				return None
+			# allow array of keys
+			if isinstance(current, list):
+				OpenClaim._set_cache(OpenClaim._key_cache, OpenClaim._key_cache_time, key_str, current)
+				return current
 
-			return {"typ": typ, "value": current}
+			if isinstance(current, str):
+				resolved = OpenClaim.resolve_key(current, next_seen)
+				OpenClaim._set_cache(OpenClaim._key_cache, OpenClaim._key_cache_time, key_str, resolved)
+				return resolved
 
-		return {"typ": typ, "value": rest}
+			OpenClaim._set_cache(OpenClaim._key_cache, OpenClaim._key_cache_time, key_str, None)
+			return None
 
+		# --- LEGACY ---
+		idx = key_str.find(":")
+		if idx <= 0:
+			return None
+
+		scheme = key_str[:idx].upper()
+		rest = key_str[idx + 1:]
+
+		result = {
+			"fmt": scheme,
+			"value": rest
+		}
+
+		OpenClaim._set_cache(OpenClaim._key_cache, OpenClaim._key_cache_time, key_str, result)
+		return result
+
+	# ---------- SORTED STATE ----------
+
+	@staticmethod
+	def build_sorted_key_state(keys_input, signatures_input):
+		keys = OpenClaim.to_array(keys_input)[:]
+		signatures = OpenClaim.normalize_signatures(signatures_input)
+
+		OpenClaim.ensure_string_keys(keys)
+		OpenClaim.ensure_unique_keys(keys)
+
+		if len(signatures) > len(keys):
+			raise Exception("OpenClaim: signature array cannot be longer than key array")
+
+		pairs = []
+
+		for i, key in enumerate(keys):
+			pairs.append({
+				"key": key,
+				"sig": signatures[i] if i < len(signatures) else None
+			})
+
+		pairs.sort(key=lambda p: p["key"])
+
+		sorted_keys = [p["key"] for p in pairs]
+		sorted_signatures = [p["sig"] for p in pairs]
+
+		OpenClaim.ensure_sorted_keys(sorted_keys)
+
+		return {
+			"keys": sorted_keys,
+			"signatures": sorted_signatures
+		}
+
+	# ---------- POLICY ----------
+
+	@staticmethod
+	def parse_verify_policy(policy, total_keys):
+		if policy is None:
+			return {"minValid": 1}
+
+		if isinstance(policy, int):
+			return {"minValid": policy}
+
+		if policy.get("mode") == "all":
+			return {"minValid": total_keys}
+
+		if isinstance(policy.get("minValid"), int):
+			return {"minValid": policy.get("minValid")}
+
+		return {"minValid": 1}
 
 	# ---------- SIGN ----------
 
 	@staticmethod
-	def sign(claim, private_key):
-		return OpenClaim.sign_with_existing(claim, private_key, {})
-
-
-	@staticmethod
-	def sign_with_existing(claim, private_key, existing):
-
-		keys = OpenClaim.to_array(existing.get("keys") or claim.get("key"))
-		sigs = OpenClaim.to_array(existing.get("signatures") or claim.get("sig"))
+	def sign(claim, private_key, existing=None):
+		if existing is None:
+			existing = {}
 
 		pub = private_key.public_key()
 
@@ -200,99 +440,109 @@ class OpenClaim:
 			format=serialization.PublicFormat.SubjectPublicKeyInfo
 		)
 
-		key_str = "es256:" + base64.b64encode(pub_der).decode()
+		signer_key = "data:key/es256;base64," + base64.b64encode(pub_der).decode()
 
-		if key_str not in keys:
-			keys.append(key_str)
+		keys = existing.get("keys") if "keys" in existing else claim.get("key")
+		signatures = existing.get("signatures") if "signatures" in existing else claim.get("sig")
 
-		keys = sorted(keys)
-		OpenClaim.ensure_sorted(keys)
+		keys = OpenClaim.to_array(keys)
+		signatures = OpenClaim.normalize_signatures(signatures)
 
-		while len(sigs) < len(keys):
-			sigs.append(None)
+		if not keys:
+			keys = [signer_key]
+		elif signer_key not in keys:
+			keys = keys + [signer_key]
 
-		index = keys.index(key_str)
+		state = OpenClaim.build_sorted_key_state(keys, signatures)
+		signer_index = state["keys"].index(signer_key)
 
 		tmp = dict(claim)
-		tmp["key"] = keys
-		tmp["sig"] = sigs
+		tmp["key"] = state["keys"]
+		tmp["sig"] = state["signatures"]
 
 		canon = OpenClaim.canonicalize(tmp)
+		hash_bytes = OpenClaim.sha256(canon)
 
 		sig = private_key.sign(
-			canon,
-			ec.ECDSA(hashes.SHA256())
+			hash_bytes,
+			ec.ECDSA(utils.Prehashed(hashes.SHA256()))
 		)
 
-		sigs[index] = base64.b64encode(sig).decode()
+		state["signatures"][signer_index] = base64.b64encode(sig).decode()
 
-		out = dict(claim)
-		out["key"] = keys
-		out["sig"] = sigs
-
-		return out
-
+		return {
+			**claim,
+			"key": state["keys"],
+			"sig": state["signatures"]
+		}
 
 	# ---------- VERIFY ----------
 
 	@staticmethod
-	def verify(claim, public_key):
-		return OpenClaim.verify_with_policy(claim, public_key, {})
-
-
-	@staticmethod
-	def verify_with_policy(claim, public_key, policy):
+	def verify(claim, policy=None):
+		if policy is None:
+			policy = {}
 
 		keys = OpenClaim.to_array(claim.get("key"))
-		sigs = OpenClaim.to_array(claim.get("sig"))
+		signatures = OpenClaim.normalize_signatures(claim.get("sig"))
 
-		if not keys or not sigs:
-			return False
+		if not keys:
+			raise Exception("OpenClaim: missing public keys")
 
-		if len(keys) != len(sigs):
-			return False
-
-		OpenClaim.ensure_sorted(keys)
+		state = OpenClaim.build_sorted_key_state(keys, signatures)
+		keys = state["keys"]
+		signatures = state["signatures"]
 
 		tmp = dict(claim)
 		tmp["key"] = keys
-		tmp["sig"] = sigs
+		tmp["sig"] = signatures
 
 		canon = OpenClaim.canonicalize(tmp)
+		hash_bytes = OpenClaim.sha256(canon)
 
 		valid = 0
 
 		for i in range(len(keys)):
 
-			sig_b64 = sigs[i]
-			if sig_b64 is None:
+			sig = signatures[i]
+			if not sig:
 				continue
 
 			key_obj = OpenClaim.resolve_key(keys[i])
-			if not key_obj:
-				continue
 
-			if key_obj["typ"] == "EIP712":
-				continue
+			key_objs = key_obj if isinstance(key_obj, list) else [key_obj]
 
-			if key_obj["typ"] != "ES256":
-				continue
+			for ko in key_objs:
 
-			pub = OpenClaim.der_to_public_key(key_obj["value"])
+				if not ko:
+					continue
 
-			try:
-				pub.verify(
-					base64.b64decode(sig_b64),
-					canon,
-					ec.ECDSA(hashes.SHA256())
-				)
-				valid += 1
-			except Exception:
-				pass
+				if ko.get("fmt") == "ES256":
+					der_b64 = OpenClaim.to_base64_der_string(ko.get("value"))
 
-		min_valid = policy.get("minValid", 1)
+					try:
+						pub = OpenClaim.get_cached_public_key(der_b64)
+					except Exception:
+						continue
 
-		if policy.get("mode") == "all":
-			min_valid = len(keys)
+					try:
+						pub.verify(
+							base64.b64decode(sig),
+							hash_bytes,
+							ec.ECDSA(utils.Prehashed(hashes.SHA256()))
+						)
+						valid += 1
+						break
+					except Exception:
+						pass
 
-		return valid >= min_valid
+				if ko.get("fmt") == "EIP712":
+					if hasattr(OpenClaim, "EVM") and OpenClaim.EVM and hasattr(OpenClaim.EVM, "verify_key"):
+						try:
+							if OpenClaim.EVM.verify_key(claim, ko, sig):
+								valid += 1
+								break
+						except Exception:
+							pass
+
+		return valid >= OpenClaim.parse_verify_policy(policy, len(keys))["minValid"]
